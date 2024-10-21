@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <cutils/partition_utils.h>
 #include <sys/mount.h>
+#include <linux/magic.h>
 
 #include <android-base/properties.h>
 #include <android-base/unique_fd.h>
@@ -35,6 +36,18 @@
 
 #include "fs_mgr_priv.h"
 #include "cryptfs.h"
+
+#define F2FS_BLKSIZE 4096
+#define F2FS_SUPER_OFFSET 1024
+
+struct f2fs_super_block {
+       __le32 magic;                   /* Magic Number */
+       __le16 major_ver;               /* Major Version */
+       __le16 minor_ver;               /* Minor Version */
+       __le32 empty[6];
+       __le32 checksum_offset;         /* checksum offset inside super block */
+       __le64 block_count;             /* total # of user blocks */
+} __attribute__((packed));
 
 using android::base::unique_fd;
 
@@ -159,6 +172,15 @@ static int format_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool crypt
     return logwrap_fork_execvp(args.size(), args.data(), nullptr, false, LOG_KLOG, false, nullptr);
 }
 
+static int format_vfat(const std::string& fs_blkdev) {
+    if (access("/system/bin/newfs_msdos", X_OK)) {
+        LINFO << "format vfat no access" << " /system/bin/newfs_msdos ";
+    }
+    LERROR << __FUNCTION__ << ": Format " << fs_blkdev.c_str();
+    std::vector<const char*> args = {"/system/bin/newfs_msdos", "-O", "android", fs_blkdev.c_str()};
+    return logwrap_fork_execvp(args.size(), args.data(), nullptr, false, LOG_KLOG, false,nullptr);
+}
+
 int fs_mgr_do_format(const FstabEntry& entry, bool crypt_footer) {
     LERROR << __FUNCTION__ << ": Format " << entry.blk_device << " as '" << entry.fs_type << "'";
 
@@ -176,6 +198,70 @@ int fs_mgr_do_format(const FstabEntry& entry, bool crypt_footer) {
     } else if (entry.fs_type == "ext4") {
         return format_ext4(entry.blk_device, entry.mount_point, crypt_footer, needs_projid,
                            entry.fs_mgr_flags.ext_meta_csum);
+    } else if (entry.fs_type == "vfat") {
+        return format_vfat(entry.blk_device);
+    } else {
+        LERROR << "File system type '" << entry.fs_type << "' is not supported";
+        return -EINVAL;
+    }
+}
+
+static bool read_f2fs_sb(const std::string& blk_device, struct f2fs_super_block *sb) {
+    unique_fd fd(TEMP_FAILURE_RETRY(open(blk_device.c_str(), O_RDONLY | O_CLOEXEC)));
+    if (TEMP_FAILURE_RETRY(pread(fd, sb, sizeof(*sb), F2FS_SUPER_OFFSET)) != sizeof(*sb)) {
+        return false;
+    }
+    if (sb->magic == cpu_to_le32(F2FS_SUPER_MAGIC)) return true;
+    if (TEMP_FAILURE_RETRY(pread(fd, sb, sizeof(*sb), F2FS_BLKSIZE + F2FS_SUPER_OFFSET)) != sizeof(*sb)) {
+        return false;
+    }
+    return sb->magic == cpu_to_le32(F2FS_SUPER_MAGIC);
+}
+
+static uint64_t get_f2fs_size(const std::string& blk_device) {
+    struct f2fs_super_block sb;
+    if (read_f2fs_sb(blk_device, &sb)) {
+        return sb.block_count * F2FS_BLKSIZE;
+    }
+    return 0;
+}
+
+static int resize_f2fs(const std::string& fs_blkdev, uint64_t dev_sz, bool crypt_footer) {
+    if (!dev_sz) {
+        int rc = get_dev_sz(fs_blkdev, &dev_sz);
+        if (rc) {
+            return rc;
+        }
+    }
+
+    /* Format the partition using the calculated length */
+    if (crypt_footer) {
+        dev_sz -= CRYPT_FOOTER_OFFSET;
+    }
+    LINFO << "dev_sz: " << dev_sz;
+    uint64_t f2fs_sz = get_f2fs_size(fs_blkdev);
+    LINFO << "f2fs_sz: " << f2fs_sz;
+    if (f2fs_sz <= 0 || dev_sz <= f2fs_sz + 4096 * 1024) {
+       LINFO << "no need resize";
+       return 0;
+    }
+
+    std::string size_str = std::to_string(dev_sz / 512);
+
+    std::vector<const char*> args = {"/system/bin/resize.f2fs", "-t"};
+    args.push_back(size_str.c_str());
+    args.push_back(fs_blkdev.c_str());
+
+    return logwrap_fork_execvp(args.size(), args.data(), nullptr, false, LOG_KLOG, false, nullptr);
+}
+
+int fs_mgr_do_resize(const FstabEntry& entry, bool crypt_footer) {
+    LERROR << __FUNCTION__ << ": Reszie " << entry.blk_device << " as '" << entry.length << "'";
+
+    if (entry.fs_type == "f2fs") {
+        return resize_f2fs(entry.blk_device, entry.length, crypt_footer);
+    //} else if (entry.fs_type == "ext4") {
+    //    return resize_ext4(entry.blk_device, entry.mount_point, crypt_footer);
     } else {
         LERROR << "File system type '" << entry.fs_type << "' is not supported";
         return -EINVAL;

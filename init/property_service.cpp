@@ -73,7 +73,6 @@
 #include "subcontext.h"
 #include "system/core/init/property_service.pb.h"
 #include "util.h"
-#include "vendor_init.h"
 
 using namespace std::literals;
 
@@ -1084,6 +1083,7 @@ void PropertyLoadBootDefaults() {
     load_properties_from_file("/odm_dlkm/etc/build.prop", nullptr, &properties);
     load_properties_from_partition("odm", /* support_legacy_path_until */ 28);
     load_properties_from_partition("product", /* support_legacy_path_until */ 30);
+    load_properties_from_file("/oem/build.prop", nullptr, &properties);
 
     if (access(kDebugRamdiskProp, R_OK) == 0) {
         LOG(INFO) << "Loading " << kDebugRamdiskProp;
@@ -1300,9 +1300,6 @@ static void HandleInitSocket() {
             InitPropertySet("ro.persistent_properties.ready", "true");
             persistent_properties_loaded = true;
 
-            /* vendor-specific properties
-            */
-            vendor_load_properties();
             break;
         }
         default:

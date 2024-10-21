@@ -633,7 +633,8 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
         RebootSystem(cmd, reboot_target);
         abort();
     }
-
+    
+    bool do_shutdown_animation = GetBoolProperty("ro.init.shutdown_animation", false);
     // watchdogd is a vendor specific component but should be alive to complete shutdown safely.
     const std::set<std::string> to_starts{"watchdogd"};
     std::set<std::string> stop_first;
@@ -647,6 +648,8 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
                            << "': " << result.error();
             }
             s->SetShutdownCritical();
+        } else if (do_shutdown_animation) {
+            continue;
         } else if (s->IsShutdownCritical()) {
             // Start shutdown critical service if not started.
             if (auto result = s->Start(); !result.ok()) {
@@ -659,14 +662,13 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     }
 
     // remaining operations (specifically fsck) may take a substantial duration
-    if (cmd == ANDROID_RB_POWEROFF || is_thermal_shutdown) {
+    if (!do_shutdown_animation && (cmd == ANDROID_RB_POWEROFF || is_thermal_shutdown)) {
         TurnOffBacklight();
     }
 
     Service* boot_anim = ServiceList::GetInstance().FindService("bootanim");
     Service* surface_flinger = ServiceList::GetInstance().FindService("surfaceflinger");
     if (boot_anim != nullptr && surface_flinger != nullptr && surface_flinger->IsRunning()) {
-        bool do_shutdown_animation = GetBoolProperty("ro.init.shutdown_animation", false);
 
         if (do_shutdown_animation) {
             SetProperty("service.bootanim.exit", "0");
@@ -978,6 +980,17 @@ void HandlePowerctlMessage(const std::string& command) {
     bool run_fsck = false;
     bool command_invalid = false;
     bool userspace_reboot = false;
+    const char *file = "/dev/shutdown";
+    int fd = creat(file, 00666);
+    if (fd) {
+        ssize_t size = write(fd, cmd_params[0].c_str(), cmd_params[0].size());
+        if (size == 0) {
+            LOG(WARNING) << "Write reason to /dev/shutdown fail";
+        }
+        close(fd);
+    } else {
+        LOG(WARNING) << "Create /dev/shutdown fail";
+    }
 
     if (cmd_params[0] == "shutdown") {
         cmd = ANDROID_RB_POWEROFF;

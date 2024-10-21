@@ -70,7 +70,6 @@
 #include <log/log_properties.h>
 #include <logwrap/logwrap.h>
 
-#include "blockdev.h"
 #include "fs_mgr_priv.h"
 
 #define KEY_LOC_PROP   "ro.crypto.keyfile.userdata"
@@ -154,6 +153,10 @@ static bool is_f2fs(const std::string& fs_type) {
     return fs_type == "f2fs";
 }
 
+static bool is_vfat(const std::string& fs_type) {
+    return fs_type == "vfat";
+}
+
 static std::string realpath(const std::string& blk_device) {
     std::string real_path;
     if (!Realpath(blk_device, &real_path)) {
@@ -168,6 +171,14 @@ static bool should_force_check(int fs_stat) {
             FS_STAT_RO_MOUNT_FAILED | FS_STAT_RO_UNMOUNT_FAILED | FS_STAT_FULL_MOUNT_FAILED |
             FS_STAT_E2FSCK_FAILED | FS_STAT_TOGGLE_QUOTAS_FAILED |
             FS_STAT_SET_RESERVED_BLOCKS_FAILED | FS_STAT_ENABLE_ENCRYPTION_FAILED);
+}
+
+int call_msdos(const std::string& fs_blkdev) {
+    if (access("/system/bin/newfs_msdos", X_OK)) {
+        LERROR << "not access" << " /system/bin/newfs_msdos ";
+    }
+    std::vector<const char*> args = {"/system/bin/newfs_msdos", "-O", "android", fs_blkdev.c_str()};
+    return logwrap_fork_execvp(args.size(), args.data(), nullptr, false, LOG_KLOG, false, nullptr);
 }
 
 static bool umount_retry(const std::string& mount_point) {
@@ -267,21 +278,28 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
         const char* f2fs_fsck_forced_argv[] = {
                 F2FS_FSCK_BIN, "-f", "-c", "10000", "--debug-cache", blk_device.c_str()};
 
-        if (should_force_check(*fs_stat)) {
-            LINFO << "Running " << F2FS_FSCK_BIN << " -f -c 10000 --debug-cache "
-                  << realpath(blk_device);
-            ret = logwrap_fork_execvp(ARRAY_SIZE(f2fs_fsck_forced_argv), f2fs_fsck_forced_argv,
-                                      &status, false, LOG_KLOG | LOG_FILE, false, nullptr);
+        if (access(F2FS_FSCK_BIN, X_OK)) {
+            LINFO << "Not running " << F2FS_FSCK_BIN << " on " << realpath(blk_device)
+                  << " (executable not in system image)";
         } else {
-            LINFO << "Running " << F2FS_FSCK_BIN << " -a -c 10000 --debug-cache "
-                  << realpath(blk_device);
-            ret = logwrap_fork_execvp(ARRAY_SIZE(f2fs_fsck_argv), f2fs_fsck_argv, &status, false,
-                                      LOG_KLOG | LOG_FILE, false, nullptr);
+            if (should_force_check(*fs_stat)) {
+                LINFO << "Running " << F2FS_FSCK_BIN << " -f -c 10000 --debug-cache "
+                    << realpath(blk_device);
+                ret = logwrap_fork_execvp(ARRAY_SIZE(f2fs_fsck_forced_argv), f2fs_fsck_forced_argv,
+                                        &status, false, LOG_KLOG | LOG_FILE, false, FSCK_LOG_FILE);
+            } else {
+                LINFO << "Running " << F2FS_FSCK_BIN << " -a -c 10000 --debug-cache "
+                    << realpath(blk_device);
+                ret = logwrap_fork_execvp(ARRAY_SIZE(f2fs_fsck_argv), f2fs_fsck_argv, &status, false,
+                                        LOG_KLOG | LOG_FILE, false, FSCK_LOG_FILE);
+            }
+            if (ret < 0) {
+                /* No need to check for error in fork, we can't really handle it now */
+                LERROR << "Failed trying to run " << F2FS_FSCK_BIN;
+            }
         }
-        if (ret < 0) {
-            /* No need to check for error in fork, we can't really handle it now */
-            LERROR << "Failed trying to run " << F2FS_FSCK_BIN;
-        }
+    } else if (is_vfat(fs_type)) {
+        call_msdos(blk_device);
     }
     android::base::SetProperty("ro.boottime.init.fsck." + Basename(target),
                                std::to_string(t.duration().count()));
@@ -1479,6 +1497,17 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                 continue;
             }
         }
+        if (current_entry.mount_point == "/data") {
+            bool crypt_footer = false;
+            if (current_entry.is_encryptable() && current_entry.key_loc == KEY_IN_FOOTER) {
+                crypt_footer = true;
+            }
+            if (fs_mgr_do_resize(current_entry, crypt_footer) == 0) {
+                LINFO << "Resize success";
+            } else {
+                LERROR << __FUNCTION__ << "(): Resize failed. ";
+            }
+        }
 
         int last_idx_inspected;
         int top_idx = i;
@@ -2072,24 +2101,22 @@ static bool PrepareZramBackingDevice(off64_t size) {
 
     // Allocate loop device and attach it to file_path.
     LoopControl loop_control;
-    std::string loop_device;
-    if (!loop_control.Attach(target_fd.get(), 5s, &loop_device)) {
+    std::string device;
+    if (!loop_control.Attach(target_fd.get(), 5s, &device)) {
         return false;
     }
-
-    ConfigureQueueDepth(loop_device, "/");
 
     // set block size & direct IO
-    unique_fd loop_fd(TEMP_FAILURE_RETRY(open(loop_device.c_str(), O_RDWR | O_CLOEXEC)));
-    if (loop_fd.get() == -1) {
-        PERROR << "Cannot open " << loop_device;
+    unique_fd device_fd(TEMP_FAILURE_RETRY(open(device.c_str(), O_RDWR | O_CLOEXEC)));
+    if (device_fd.get() == -1) {
+        PERROR << "Cannot open " << device;
         return false;
     }
-    if (!LoopControl::EnableDirectIo(loop_fd.get())) {
+    if (!LoopControl::EnableDirectIo(device_fd.get())) {
         return false;
     }
 
-    return InstallZramDevice(loop_device);
+    return InstallZramDevice(device);
 }
 
 bool fs_mgr_swapon_all(const Fstab& fstab) {

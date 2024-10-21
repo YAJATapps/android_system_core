@@ -659,10 +659,10 @@ on late-fs
     # Bootreceiver tracing instance is enabled by default.
     setprop bootreceiver.enable ${bootreceiver.enable:-1}
 
-on property:ro.product.cpu.abilist64=* && property:bootreceiver.enable=1
+on property:bootreceiver.enable=1
     # Set up a tracing instance for system_server to monitor error_report_end events.
     # These are sent by kernel tools like KASAN and KFENCE when a memory corruption
-    # is detected. This is only needed for 64-bit systems.
+    # is detected.
     mkdir /sys/kernel/tracing/instances/bootreceiver 0700 system system
     restorecon_recursive /sys/kernel/tracing/instances/bootreceiver
     write /sys/kernel/tracing/instances/bootreceiver/buffer_size_kb 1
@@ -697,6 +697,9 @@ on post-fs-data
     mkdir /data/vendor_ce 0771 root root encryption=None
     mkdir /data/vendor_de 0771 root root encryption=None
     mkdir /data/vendor/hardware 0771 root root
+    
+    # WCN
+    mkdir /data/unisoc_dbg 0777 root root
 
     # Start tombstoned early to be able to store tombstones.
     mkdir /data/anr 0775 system system encryption=Require

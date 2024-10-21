@@ -27,7 +27,6 @@
 #include <sys/mount.h>
 #include <sys/signalfd.h>
 #include <sys/types.h>
-#include <sys/utsname.h>
 #include <unistd.h>
 
 #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
@@ -322,6 +321,9 @@ static void LoadBootScripts(ActionManager& action_manager, ServiceList& service_
         if (!parser.ParseConfig("/product/etc/init")) {
             late_import_paths.emplace_back("/product/etc/init");
         }
+        if (!parser.ParseConfig("/oem/etc/init")) {
+            late_import_paths.emplace_back("/oem/etc/init");
+        }
     } else {
         parser.ParseConfig(bootscript);
     }
@@ -555,19 +557,6 @@ static void SetUsbController() {
     }
 }
 
-/// Set ro.kernel.version property to contain the major.minor pair as returned
-/// by uname(2).
-static void SetKernelVersion() {
-    struct utsname uts;
-    unsigned int major, minor;
-
-    if ((uname(&uts) != 0) || (sscanf(uts.release, "%u.%u", &major, &minor) != 2)) {
-        LOG(ERROR) << "Could not parse the kernel version from uname";
-        return;
-    }
-    SetProperty("ro.kernel.version", android::base::StringPrintf("%u.%u", major, minor));
-}
-
 static void HandleSigtermSignal(const signalfd_siginfo& siginfo) {
     if (siginfo.ssi_pid != 0) {
         // Drop any userspace SIGTERM requests.
@@ -797,6 +786,11 @@ int SecondStageMain(int argc, char** argv) {
     if (!load_debug_prop) {
         UmountDebugRamdisk();
     }
+    
+    if (mount("/dev/block/by-name/media_data", "/oem", "vfat",MS_NOSUID|MS_NOATIME|MS_RDONLY,
+                                "errors=panic,utf8,context=u:object_r:oemfs:s0,fmask=0022,dmask=0022") != 0) {
+        LOG(ERROR) << "mount media_data fail" << "*****" <<  strerror(errno);
+    }
 
     PropertyInit();
 
@@ -838,7 +832,6 @@ int SecondStageMain(int argc, char** argv) {
     export_oem_lock_status();
     MountHandler mount_handler(&epoll);
     SetUsbController();
-    SetKernelVersion();
 
     const BuiltinFunctionMap& function_map = GetBuiltinFunctionMap();
     Action::set_function_map(&function_map);
